@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Carimbo</title>
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+
+<!-- ============ TELA INICIAL ============ -->
+<section id="inicio">
+  <header class="topo">
+    <div class="marca">Carimbo <span>de Fotos</span></div>
+    <button class="icone" id="bAjustes" aria-label="Ajustes">⚙</button>
+  </header>
+
+  <div class="gps" id="gps">
+    <span class="ponto" id="gpsPonto"></span>
+    <span id="gpsTxt">Procurando GPS…</span>
+    <button class="mini" id="bPermitir" style="display:none">Permitir</button>
+  </div>
+
+  <main class="conteudo">
+    <div class="card">
+      <label for="os">Número da OS</label>
+      <input id="os" type="text" placeholder="ex.: 4250.0123.456789/2026" autocomplete="off">
+      <label for="obs">Linha extra (opcional)</label>
+      <input id="obs" type="text" placeholder="ex.: Rua São José 120, fachada" autocomplete="off">
+      <button class="link" id="bAplicarTodas" style="display:none">Aplicar OS e linha extra a todas as fotos da lista</button>
+    </div>
+
+    <div class="acoes">
+      <button class="grande" id="bCamera"><span>📷</span>Tirar foto</button>
+      <button class="grande sec" id="bGaleria"><span>🖼</span>Da galeria</button>
+    </div>
+
+    <div class="titulo-lista">
+      <span id="contagem">Nenhuma foto</span>
+      <button class="link" id="bLimpar" style="display:none">Nova vistoria</button>
+    </div>
+    <div id="grade" class="grade"></div>
+  </main>
+
+  <footer class="rodape" id="rodape" style="display:none">
+    <button class="btn sec" id="bCompartilhar">Enviar</button>
+    <button class="btn" id="bSalvarTodas">Salvar todas</button>
+  </footer>
+</section>
+
+<!-- ============ EDITOR ============ -->
+<section id="editor" class="tela" hidden>
+  <header class="topo">
+    <button class="icone" id="eVoltar" aria-label="Voltar">←</button>
+    <div class="marca" id="eTitulo">Editar foto</div>
+    <button class="icone" id="eApagar" aria-label="Tirar da lista">🗑</button>
+  </header>
+
+  <div class="previa" id="ePrevia">
+    <canvas id="eCanvas"></canvas>
+    <div id="eCorte" class="corte" hidden>
+      <div class="caixa" id="eCaixa">
+        <i data-c="nw"></i><i data-c="ne"></i><i data-c="sw"></i><i data-c="se"></i>
+      </div>
+    </div>
+  </div>
+
+  <div class="abas">
+    <button class="aba ativa" data-aba="carimbo">Carimbo</button>
+    <button class="aba" data-aba="foto">Foto</button>
+    <button class="aba" data-aba="dados">Dados</button>
+  </div>
+
+  <div class="painel" id="pCarimbo">
+    <label for="eOs">Número da OS</label>
+    <input id="eOs" type="text" autocomplete="off">
+    <div class="linha">
+      <div><label for="eBairro">Bairro</label><input id="eBairro" type="text" autocomplete="off"></div>
+      <div><label for="eCidade">Cidade</label><input id="eCidade" type="text" autocomplete="off"></div>
+    </div>
+    <label for="eObs">Linha extra</label>
+    <input id="eObs" type="text" autocomplete="off">
+    <div class="linha">
+      <div><label for="ePos">Posição</label>
+        <select id="ePos">
+          <option value="br">Embaixo à direita</option>
+          <option value="bl">Embaixo à esquerda</option>
+          <option value="tr">Em cima à direita</option>
+          <option value="tl">Em cima à esquerda</option>
+        </select></div>
+      <div><label for="eTam">Tamanho</label>
+        <select id="eTam">
+          <option value="0.75">Pequeno</option>
+          <option value="1">Médio</option>
+          <option value="1.3">Grande</option>
+          <option value="1.6">Muito grande</option>
+        </select></div>
+    </div>
+  </div>
+
+  <div class="painel" id="pFoto" hidden>
+    <div class="linha botoes">
+      <button class="btn sec" id="eGirarE">↺ Girar</button>
+      <button class="btn sec" id="eGirarD">Girar ↻</button>
+      <button class="btn sec" id="eCortar">✂ Cortar</button>
+    </div>
+    <div id="eCorteBotoes" class="linha botoes" hidden>
+      <button class="btn sec" id="eCorteTudo">Foto inteira</button>
+      <button class="btn sec" id="eCorteCancelar">Cancelar</button>
+      <button class="btn" id="eCorteOk">Aplicar corte</button>
+    </div>
+    <label for="eBri">Brilho <b id="eBriV">0 %</b></label>
+    <input id="eBri" type="range" min="-50" max="50" step="1" value="0">
+    <label for="eCon">Contraste <b id="eConV">0 %</b></label>
+    <input id="eCon" type="range" min="-50" max="50" step="1" value="0">
+    <button class="link" id="eRestaurar">Voltar a foto ao original</button>
+  </div>
+
+  <div class="painel" id="pDados" hidden>
+    <div id="eInfo" class="info"></div>
+    <div id="eSemGps" hidden>
+      <label for="eCoord">Coordenadas (a foto veio sem GPS)</label>
+      <input id="eCoord" type="text" placeholder="−3,731920 −40,991234" autocomplete="off">
+      <div class="dica">Copie do Google Maps: toque e segure no lugar e copie os números.</div>
+    </div>
+    <div id="eSemData" hidden>
+      <label for="eData">Data e hora (a foto veio sem a data da câmera)</label>
+      <input id="eData" type="datetime-local" step="1">
+    </div>
+  </div>
+
+  <footer class="rodape">
+    <button class="btn sec" id="eCancelar">Cancelar</button>
+    <button class="btn" id="eSalvar">Salvar</button>
+  </footer>
+</section>
+
+<!-- ============ AJUSTES ============ -->
+<section id="ajustes" class="tela" hidden>
+  <header class="topo">
+    <button class="icone" id="aVoltar" aria-label="Voltar">←</button>
+    <div class="marca">Ajustes</div><span style="width:44px"></span>
+  </header>
+  <main class="conteudo">
+    <div class="card">
+      <label class="chk"><input type="checkbox" id="aAuto"> Salvar na galeria assim que tirar a foto</label>
+      <label class="chk"><input type="checkbox" id="aBairro"> Mostrar o bairro</label>
+      <label class="chk"><input type="checkbox" id="aUf"> Mostrar a UF junto da cidade</label>
+      <label class="chk"><input type="checkbox" id="aAlt"> Mostrar a altitude</label>
+      <label class="chk"><input type="checkbox" id="aPrec"> Mostrar a precisão do GPS</label>
+    </div>
+    <div class="card">
+      <div class="linha">
+        <div><label for="aPos">Posição padrão</label>
+          <select id="aPos">
+            <option value="br">Embaixo à direita</option>
+            <option value="bl">Embaixo à esquerda</option>
+            <option value="tr">Em cima à direita</option>
+            <option value="tl">Em cima à esquerda</option>
+          </select></div>
+        <div><label for="aTam">Tamanho padrão</label>
+          <select id="aTam">
+            <option value="0.75">Pequeno</option>
+            <option value="1">Médio</option>
+            <option value="1.3">Grande</option>
+            <option value="1.6">Muito grande</option>
+          </select></div>
+      </div>
+      <label for="aLado">Tamanho da foto salva</label>
+      <select id="aLado">
+        <option value="0">Original (maior arquivo)</option>
+        <option value="4000">4000 px no lado maior</option>
+        <option value="3000">3000 px no lado maior</option>
+        <option value="2000">2000 px no lado maior (arquivo leve)</option>
+      </select>
+    </div>
+    <p class="dica centro">As fotos carimbadas ficam na galeria, na pasta <b>Imagens › Carimbo</b>. A data, a hora e as coordenadas vêm do GPS e da câmera e não podem ser alteradas.</p>
+    <p class="dica centro" id="versao"></p>
+  </main>
+</section>
+
+<!-- ============ AVISOS ============ -->
+<div id="espera" class="espera" hidden><div class="caixinha"><div class="giro"></div><div id="esperaTxt">Salvando…</div></div></div>
+<div id="dialogo" class="espera" hidden>
+  <div class="caixinha dlg">
+    <div id="dlgTxt"></div>
+    <div class="linha botoes"><button class="btn sec" id="dlgNao">Cancelar</button><button class="btn" id="dlgSim">Confirmar</button></div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script src="piexif.js"></script>
+<script src="mun.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
