@@ -59,7 +59,7 @@ class Camera2Ultra(
     private fun iniciar() {
         try {
             val mapa = car.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-            val foto = escolher(mapa.getOutputSizes(ImageFormat.JPEG), 3300)
+            val foto = escolher(mapa.getOutputSizes(ImageFormat.JPEG), 5000)
             val prev = escolher(mapa.getOutputSizes(SurfaceTexture::class.java), 1600)
             leitor = ImageReader.newInstance(foto.width, foto.height, ImageFormat.JPEG, 2)
             textura.surfaceTexture!!.setDefaultBufferSize(prev.width, prev.height)
@@ -109,7 +109,10 @@ class Camera2Ultra(
                 superficie?.let { addTarget(it) }
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.JPEG_ORIENTATION, 0)
-                set(CaptureRequest.JPEG_QUALITY, 92.toByte())
+                set(CaptureRequest.JPEG_QUALITY, 97.toByte())
+                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             }
             ss.capture(req.build(), null, h)
         } catch (e: Exception) { erro("Foto pela lente $id falhou: ${e.message}") }

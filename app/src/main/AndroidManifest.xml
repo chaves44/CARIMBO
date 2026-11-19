@@ -25,7 +25,8 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/nome_app"
         android:theme="@style/Tema"
-        android:requestLegacyExternalStorage="true">
+        android:requestLegacyExternalStorage="true"
+        android:largeHeap="true">
 
         <activity
             android:name=".CameraActivity"

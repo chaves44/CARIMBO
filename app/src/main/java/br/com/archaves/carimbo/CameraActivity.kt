@@ -96,8 +96,8 @@ import kotlin.math.sqrt
 class CameraActivity : ComponentActivity() {
 
     companion object {
-        const val LADO = 1600            // lado maior da foto gravada (as fotos do RAE são 1600 x 1200)
-        const val QUALIDADE = 80         // JPEG: ~150 a 300 kB por foto
+        // níveis de qualidade: lado maior (px) e JPEG. Padrão "Boa".
+        val NIVEIS = listOf(Triple("Leve", 1600, 82), Triple("Boa", 2048, 90), Triple("Máxima", 2560, 94))
         const val RAIO_OS = 300.0        // m: escolhe sozinho a OS mais próxima até essa distância
         const val REQ = 31
         private val MESES = arrayOf("jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez.")
@@ -148,6 +148,10 @@ class CameraActivity : ComponentActivity() {
     private var osManual = false
     private var ultimaFoto: Uri? = null
     private val prefs by lazy { getSharedPreferences("camera", MODE_PRIVATE) }
+    private var nivel = 1
+    private val LADO get() = NIVEIS[nivel].second
+    private val QUALIDADE get() = NIVEIS[nivel].third
+    private lateinit var qualTxt: TextView
 
     private val ouvinte = LocationListener { l ->
         val a = local
@@ -247,6 +251,16 @@ class CameraActivity : ComponentActivity() {
         gpsTxt = TextView(this).apply { setTextColor(0xFFBBBBBB.toInt()); textSize = 12f; gravity = Gravity.END }
         barra.addView(osTxt, LinearLayout.LayoutParams(0, -2, 1f))
         barra.addView(gpsTxt, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(8) })
+        nivel = prefs.getInt("nivel", 1)
+        qualTxt = pilula(NIVEIS[nivel].first).apply {
+            textSize = 12f; setPadding(dpi(10), dpi(6), dpi(10), dpi(6))
+            setOnClickListener {
+                nivel = (nivel + 1) % NIVEIS.size; prefs.edit().putInt("nivel", nivel).apply()
+                text = NIVEIS[nivel].first
+                Toast.makeText(this@CameraActivity, "Qualidade ${NIVEIS[nivel].first}: ${NIVEIS[nivel].second} x ${NIVEIS[nivel].second * 3 / 4} px", Toast.LENGTH_SHORT).show()
+            }
+        }
+        barra.addView(qualTxt, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(8) })
         raiz.addView(barra, FrameLayout.LayoutParams(-1, topo, Gravity.TOP))
 
         // lentes 0.6, 1x, 2x
@@ -466,14 +480,14 @@ class CameraActivity : ComponentActivity() {
         val info = (if (usarUltra) infoUltra else infoPrincipal) ?: return
         val res = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy(Size(3264, 2448), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .setResolutionStrategy(ResolutionStrategy(Size(4624, 3468), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
             .build()
         val pb = Preview.Builder()
             .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
         val cb = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .setResolutionSelector(res)
-            .setJpegQuality(92)
+            .setJpegQuality(97)
             .setTargetRotation(rotacao)
         if (usarFisica) {
             Camera2Interop.Extender(pb).setPhysicalCameraId(fisicoUltra!!)
@@ -612,10 +626,23 @@ class CameraActivity : ComponentActivity() {
         val (cw, ch) = if (w * 3 > h * 4) Pair(h * 4 / 3, h) else Pair(w, w * 3 / 4)
         val cortada = Bitmap.createBitmap(girada, (w - cw) / 2, (h - ch) / 2, cw, ch)
         val (fw, fh) = Pair(LADO, LADO * 3 / 4)
-        val final = Bitmap.createScaledBitmap(cortada, fw, fh, true)
+        val final = reduzir(cortada, fw, fh)
         if (cortada !== final && cortada !== girada) cortada.recycle()
         if (girada !== final) girada.recycle()
         return if (final.isMutable) final else final.copy(Bitmap.Config.ARGB_8888, true).also { final.recycle() }
+    }
+
+    /** Reduz pela metade em etapas antes do tamanho final: fica bem mais nítido que reduzir de uma vez. */
+    private fun reduzir(b0: Bitmap, fw: Int, fh: Int): Bitmap {
+        var b = b0
+        while (b.width / 2 >= fw) {
+            val n = Bitmap.createScaledBitmap(b, b.width / 2, b.height / 2, true)
+            if (b !== b0) b.recycle()
+            b = n
+        }
+        val f = Bitmap.createScaledBitmap(b, fw, fh, true)
+        if (b !== b0 && b !== f) b.recycle()
+        return f
     }
 
     private fun linhas(quando: Date, loc: Location?, end: Pair<String, String>?, o: JSONObject?): List<String> {
