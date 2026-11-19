@@ -107,6 +107,11 @@ class CameraActivity : ComponentActivity() {
     private lateinit var previa: PreviewView
     private lateinit var caixaPrevia: FrameLayout
     private lateinit var carimboTxt: TextView
+    private lateinit var camada: FrameLayout      // área da foto na tela, girada junto com o celular
+    private lateinit var faixaCima: View
+    private lateinit var faixaBaixo: View
+    private var largPrev = 0
+    private var altPrev = 0
     private lateinit var osTxt: TextView
     private lateinit var gpsTxt: TextView
     private lateinit var miniatura: ImageView
@@ -217,12 +222,20 @@ class CameraActivity : ComponentActivity() {
         caixaPrevia.addView(previa, FrameLayout.LayoutParams(-1, -1))
         textura = TextureView(this).apply { visibility = View.GONE }
         caixaPrevia.addView(textura, FrameLayout.LayoutParams(-1, -1))
+        largPrev = larg; altPrev = alt
+        val faixa = (alt - larg * 3 / 4) / 2
+        faixaCima = View(this).apply { setBackgroundColor(0x99000000.toInt()) }
+        faixaBaixo = View(this).apply { setBackgroundColor(0x99000000.toInt()) }
+        caixaPrevia.addView(faixaCima, FrameLayout.LayoutParams(-1, faixa, Gravity.TOP))
+        caixaPrevia.addView(faixaBaixo, FrameLayout.LayoutParams(-1, faixa, Gravity.BOTTOM))
+        camada = FrameLayout(this)
+        caixaPrevia.addView(camada, FrameLayout.LayoutParams(larg, larg * 3 / 4, Gravity.CENTER))
         carimboTxt = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 12f; gravity = Gravity.END
             setShadowLayer(4f, 1f, 1f, Color.BLACK)
             setPadding(dpi(8), dpi(8), dpi(10), dpi(8))
         }
-        caixaPrevia.addView(carimboTxt, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END))
+        camada.addView(carimboTxt, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END))
         flash = View(this).apply { setBackgroundColor(Color.WHITE); alpha = 0f }
         caixaPrevia.addView(flash, FrameLayout.LayoutParams(-1, -1))
         val topo = dpi(56)
@@ -298,6 +311,7 @@ class CameraActivity : ComponentActivity() {
             true
         }
         setContentView(raiz)
+        ajustarCamada()
     }
 
     // ---------------------------------------------------------------- permissões
@@ -452,7 +466,7 @@ class CameraActivity : ComponentActivity() {
         val info = (if (usarUltra) infoUltra else infoPrincipal) ?: return
         val res = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy(Size(2048, 1536), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .setResolutionStrategy(ResolutionStrategy(Size(3264, 2448), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
             .build()
         val pb = Preview.Builder()
             .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
@@ -507,7 +521,8 @@ class CameraActivity : ComponentActivity() {
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(g: Int) {
                 if (g == ORIENTATION_UNKNOWN) return
-                grausAparelho = ((g + 45) / 90 * 90) % 360
+                val ga = ((g + 45) / 90 * 90) % 360
+                if (ga != grausAparelho) { grausAparelho = ga; ajustarCamada() }
                 val r = when (g) { in 45..134 -> Surface.ROTATION_270; in 135..224 -> Surface.ROTATION_180; in 225..314 -> Surface.ROTATION_90; else -> Surface.ROTATION_0 }
                 if (r != rotacao) {
                     rotacao = r; captura?.targetRotation = r
@@ -517,6 +532,24 @@ class CameraActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * A foto sai sempre deitada (paisagem 4:3). Com o celular em pé, a tela escurece em cima e embaixo
+     * e mostra só a faixa que vai virar foto; com o celular deitado, a foto é a tela toda.
+     * O carimbo gira junto para ficar no canto de baixo à direita da foto.
+     */
+    private fun ajustarCamada() {
+        val emPe = grausAparelho == 0 || grausAparelho == 180
+        faixaCima.visibility = if (emPe) View.VISIBLE else View.GONE
+        faixaBaixo.visibility = if (emPe) View.VISIBLE else View.GONE
+        val lp = camada.layoutParams as FrameLayout.LayoutParams
+        if (emPe) { lp.width = largPrev; lp.height = largPrev * 3 / 4 } else { lp.width = altPrev; lp.height = largPrev }
+        lp.gravity = Gravity.CENTER
+        camada.layoutParams = lp
+        var r = -grausAparelho.toFloat()
+        if (r <= -180f) r += 360f
+        camada.rotation = r
     }
 
     // ---------------------------------------------------------------- foto
@@ -571,18 +604,14 @@ class CameraActivity : ComponentActivity() {
         val op = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, op)
         var amostra = 1
-        while (max(op.outWidth, op.outHeight) / (amostra * 2) >= LADO) amostra *= 2
+        while (min(op.outWidth, op.outHeight) / (amostra * 2) >= LADO) amostra *= 2
         val orig = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = amostra })
         val girada = if (rot != 0) Bitmap.createBitmap(orig, 0, 0, orig.width, orig.height, Matrix().apply { postRotate(rot.toFloat()) }, true).also { if (it !== orig) orig.recycle() } else orig
         val w = girada.width; val h = girada.height
-        val deitada = w >= h
-        val (cw, ch) = if (deitada) {
-            if (w * 3 > h * 4) Pair(h * 4 / 3, h) else Pair(w, w * 3 / 4)
-        } else {
-            if (h * 3 > w * 4) Pair(w, w * 4 / 3) else Pair(h * 3 / 4, h)
-        }
+        // sempre paisagem 4:3: em pé, corta a faixa do meio
+        val (cw, ch) = if (w * 3 > h * 4) Pair(h * 4 / 3, h) else Pair(w, w * 3 / 4)
         val cortada = Bitmap.createBitmap(girada, (w - cw) / 2, (h - ch) / 2, cw, ch)
-        val (fw, fh) = if (deitada) Pair(LADO, LADO * 3 / 4) else Pair(LADO * 3 / 4, LADO)
+        val (fw, fh) = Pair(LADO, LADO * 3 / 4)
         val final = Bitmap.createScaledBitmap(cortada, fw, fh, true)
         if (cortada !== final && cortada !== girada) cortada.recycle()
         if (girada !== final) girada.recycle()
