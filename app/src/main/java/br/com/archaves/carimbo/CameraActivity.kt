@@ -1,0 +1,827 @@
+package br.com.archaves.carimbo
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.AlertDialog
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.hardware.camera2.CameraCharacteristics
+import android.location.Geocoder
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.media.MediaActionSound
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import android.text.InputType
+import android.util.Size
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.OrientationEventListener
+import android.view.ScaleGestureDetector
+import android.view.Surface
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.FileProvider
+import androidx.exifinterface.media.ExifInterface
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import kotlin.concurrent.thread
+import kotlin.math.abs
+import kotlin.math.asin
+import kotlin.math.atan
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/**
+ * Câmera do CARIMBO, no estilo do Timestamp Camera: abre direto na câmera, mostra o carimbo
+ * ao vivo e grava a foto já carimbada em 4:3, 1600 x 1200 px, comprimida, na pasta da OS
+ * (Imagens/Carimbo/OS <número> <cidade> <bairro>).
+ */
+class CameraActivity : ComponentActivity() {
+
+    companion object {
+        const val LADO = 1600            // lado maior da foto gravada (as fotos do RAE são 1600 x 1200)
+        const val QUALIDADE = 80         // JPEG: ~150 a 300 kB por foto
+        const val RAIO_OS = 300.0        // m: escolhe sozinho a OS mais próxima até essa distância
+        const val REQ = 31
+        private val MESES = arrayOf("jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez.")
+    }
+
+    // ---------- tela ----------
+    private lateinit var previa: PreviewView
+    private lateinit var caixaPrevia: FrameLayout
+    private lateinit var carimboTxt: TextView
+    private lateinit var osTxt: TextView
+    private lateinit var gpsTxt: TextView
+    private lateinit var miniatura: ImageView
+    private lateinit var lentes: LinearLayout
+    private lateinit var flash: View
+    private val botoesZoom = mutableMapOf<String, TextView>()
+
+    // ---------- câmera ----------
+    private var provedor: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var captura: ImageCapture? = null
+    private var infoPrincipal: CameraInfo? = null
+    private var infoUltra: CameraInfo? = null
+    private var lente = "1"
+    private val executor = Executors.newSingleThreadExecutor()
+    private var rotacao = Surface.ROTATION_0
+    private val som = MediaActionSound()
+
+    // ---------- local e OS ----------
+    private val principal = Handler(Looper.getMainLooper())
+    private var local: Location? = null
+    private var gerente: LocationManager? = null
+    private var endereco: Pair<String, String>? = null      // bairro, cidade
+    private var enderecoEm: Location? = null
+    private var buscandoEndereco = false
+    private var lista = JSONArray()
+    private var os: JSONObject? = null
+    private var osManual = false
+    private var ultimaFoto: Uri? = null
+    private val prefs by lazy { getSharedPreferences("camera", MODE_PRIVATE) }
+
+    private val ouvinte = LocationListener { l ->
+        val a = local
+        if (a == null || l.time - a.time > 60_000 || l.accuracy <= a.accuracy + 15) local = l
+        if (!osManual) escolherOsPerto()
+        atualizarEndereco()
+    }
+
+    // =====================================================================
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+        montarTela()
+        lista = try { JSONArray(prefs.getString("lista", "[]")) } catch (_: Exception) { JSONArray() }
+        lerIntent(intent)
+        pedirPermissoes()
+        orientacao.enable()
+        principal.post(relogio)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        lerIntent(intent)
+    }
+
+    /** O app OS CAIXA abre a câmera mandando a OS e a lista das OS abertas. */
+    private fun lerIntent(i: Intent?) {
+        i ?: return
+        i.getStringExtra("lista")?.let { s ->
+            try { lista = JSONArray(s); prefs.edit().putString("lista", s).apply() } catch (_: Exception) {}
+        }
+        i.getStringExtra("os")?.let { n ->
+            val o = acharOs(n)
+            if (o != null) { os = o; osManual = true }
+        }
+        mostrarOs()
+    }
+
+    override fun onResume() { super.onResume(); ligarGps(); lerUltima() }
+    override fun onPause() { super.onPause(); desligarGps() }
+    override fun onDestroy() {
+        orientacao.disable(); principal.removeCallbacks(relogio); executor.shutdown(); som.release()
+        super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- tela
+
+    private fun dp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics)
+    private fun dpi(v: Int) = dp(v.toFloat()).roundToInt()
+
+    private fun pilula(txt: String, fundo: Int = 0x66000000, cor: Int = Color.WHITE): TextView = TextView(this).apply {
+        text = txt; setTextColor(cor); textSize = 14f; gravity = Gravity.CENTER
+        setPadding(dpi(12), dpi(7), dpi(12), dpi(7))
+        background = GradientDrawable().apply { cornerRadius = dp(20f); setColor(fundo) }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun montarTela() {
+        val raiz = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val larg = resources.displayMetrics.widthPixels
+        val alt = larg * 4 / 3
+
+        // prévia 3:4 (a mesma área que vai para a foto)
+        caixaPrevia = FrameLayout(this)
+        previa = PreviewView(this).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+        caixaPrevia.addView(previa, FrameLayout.LayoutParams(-1, -1))
+        carimboTxt = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 12f; gravity = Gravity.END
+            setShadowLayer(4f, 1f, 1f, Color.BLACK)
+            setPadding(dpi(8), dpi(8), dpi(10), dpi(8))
+        }
+        caixaPrevia.addView(carimboTxt, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END))
+        flash = View(this).apply { setBackgroundColor(Color.WHITE); alpha = 0f }
+        caixaPrevia.addView(flash, FrameLayout.LayoutParams(-1, -1))
+        val topo = dpi(56)
+        raiz.addView(caixaPrevia, FrameLayout.LayoutParams(larg, alt).apply { topMargin = topo })
+
+        // barra de cima: OS e GPS
+        val barra = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dpi(10), dpi(8), dpi(10), dpi(8)) }
+        osTxt = pilula("Sem OS", 0xFF005CA9.toInt()).apply { maxLines = 1; setOnClickListener { escolherOsManual() } }
+        gpsTxt = TextView(this).apply { setTextColor(0xFFBBBBBB.toInt()); textSize = 12f; gravity = Gravity.END }
+        barra.addView(osTxt, LinearLayout.LayoutParams(0, -2, 1f))
+        barra.addView(gpsTxt, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(8) })
+        raiz.addView(barra, FrameLayout.LayoutParams(-1, topo, Gravity.TOP))
+
+        // lentes 0.6, 1x, 2x
+        lentes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        for (k in listOf("0.6", "1", "2")) {
+            val b = pilula(if (k == "0.6") "0,6" else k + "x").apply {
+                textSize = 13f; setPadding(dpi(12), dpi(6), dpi(12), dpi(6))
+                setOnClickListener { trocarLente(k) }
+            }
+            botoesZoom[k] = b
+            lentes.addView(b, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(6); rightMargin = dpi(6) })
+        }
+        raiz.addView(lentes, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = topo + alt - dpi(48) })
+
+        // barra de baixo: miniatura, disparo, enviar
+        val baixo = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dpi(22), 0, dpi(22), 0) }
+        miniatura = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = GradientDrawable().apply { cornerRadius = dp(8f); setColor(0xFF333333.toInt()); setStroke(dpi(2), Color.WHITE) }
+            clipToOutline = true
+            setOnClickListener { abrirUltima() }
+        }
+        val disparo = View(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE); setStroke(dpi(5), 0xFF999999.toInt()) }
+            setOnClickListener { fotografar() }
+        }
+        val direita = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
+        val enviar = pilula("Enviar", 0xFF25D366.toInt()).apply { setOnClickListener { escolherPastaParaEnviar() } }
+        val mais = TextView(this).apply {
+            text = "Editar fotos"; setTextColor(0xFFBBBBBB.toInt()); textSize = 12f; gravity = Gravity.CENTER
+            setPadding(0, dpi(8), 0, 0)
+            setOnClickListener { startActivity(Intent(this@CameraActivity, MainActivity::class.java)) }
+        }
+        direita.addView(enviar); direita.addView(mais)
+        baixo.addView(miniatura, LinearLayout.LayoutParams(dpi(56), dpi(56)))
+        baixo.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        baixo.addView(disparo, LinearLayout.LayoutParams(dpi(76), dpi(76)))
+        baixo.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        baixo.addView(direita, LinearLayout.LayoutParams(dpi(80), -2))
+        val resto = resources.displayMetrics.heightPixels - topo - alt
+        raiz.addView(baixo, FrameLayout.LayoutParams(-1, max(dpi(110), resto), Gravity.BOTTOM))
+
+        // pinça para zoom e toque para focar
+        val pinca = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                val c = camera ?: return true
+                val z = c.cameraInfo.zoomState.value ?: return true
+                c.cameraControl.setZoomRatio((z.zoomRatio * d.scaleFactor).coerceIn(z.minZoomRatio, z.maxZoomRatio))
+                return true
+            }
+        })
+        previa.setOnTouchListener { v, e ->
+            pinca.onTouchEvent(e)
+            if (e.action == MotionEvent.ACTION_UP && !pinca.isInProgress && e.eventTime - e.downTime < 250) {
+                camera?.let { c ->
+                    val p = previa.meteringPointFactory.createPoint(e.x, e.y)
+                    c.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(p).build())
+                }
+                v.performClick()
+            }
+            true
+        }
+        setContentView(raiz)
+    }
+
+    // ---------------------------------------------------------------- permissões
+
+    private fun pedirPermissoes() {
+        val l = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 33) l.add(Manifest.permission.READ_MEDIA_IMAGES) else l.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        if (Build.VERSION.SDK_INT <= 28) l.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        val faltam = l.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (faltam.isEmpty()) { iniciarCamera(); ligarGps() } else requestPermissions(faltam.toTypedArray(), REQ)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) iniciarCamera()
+        else Toast.makeText(this, "Sem permissão de câmera", Toast.LENGTH_LONG).show()
+        ligarGps(); lerUltima()
+    }
+
+    // ---------------------------------------------------------------- câmera
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun campoVisao(i: CameraInfo): Double? = try {
+        val c = Camera2CameraInfo.from(i)
+        val f = c.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull()
+        val s = c.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        if (f != null && s != null && f > 0) 2 * atan(s.width / (2.0 * f)) else null
+    } catch (_: Exception) { null }
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun traseira(i: CameraInfo): Boolean = try {
+        Camera2CameraInfo.from(i).getCameraCharacteristic(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+    } catch (_: Exception) { false }
+
+    private fun iniciarCamera() {
+        if (provedor != null) { ligarLente(); return }
+        val f = ProcessCameraProvider.getInstance(this)
+        f.addListener({
+            val p = f.get(); provedor = p
+            val traseiras = p.availableCameraInfos.filter { traseira(it) }
+            infoPrincipal = try {
+                p.availableCameraInfos.firstOrNull { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() }
+            } catch (_: Exception) { null } ?: traseiras.firstOrNull()
+            val fovP = infoPrincipal?.let { campoVisao(it) }
+            if (fovP != null) {
+                infoUltra = traseiras.filter { it != infoPrincipal }
+                    .mapNotNull { i -> campoVisao(i)?.let { i to it } }
+                    .filter { it.second > fovP * 1.25 }
+                    .maxByOrNull { it.second }?.first
+            }
+            lente = prefs.getString("lente", "1") ?: "1"
+            ligarLente()
+        }, androidx.core.content.ContextCompat.getMainExecutor(this))
+    }
+
+    private fun ligarLente() {
+        val p = provedor ?: return
+        val usarUltra = lente == "0.6" && infoUltra != null
+        val info = (if (usarUltra) infoUltra else infoPrincipal) ?: return
+        val res = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy(Size(2048, 1536), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .build()
+        val prev = Preview.Builder()
+            .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
+            .build().also { it.setSurfaceProvider(previa.surfaceProvider) }
+        val cap = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setResolutionSelector(res)
+            .setJpegQuality(92)
+            .setTargetRotation(rotacao)
+            .build()
+        try {
+            p.unbindAll()
+            camera = p.bindToLifecycle(this, info.cameraSelector, prev, cap)
+            captura = cap
+            val c = camera!!
+            val minZ = c.cameraInfo.zoomState.value?.minZoomRatio ?: 1f
+            when {
+                lente == "0.6" && !usarUltra && minZ < 0.95f -> c.cameraControl.setZoomRatio(max(0.6f, minZ))
+                lente == "2" -> c.cameraControl.setZoomRatio(2f)
+                else -> c.cameraControl.setZoomRatio(1f)
+            }
+            if (lente == "0.6" && !usarUltra && minZ >= 0.95f) {
+                Toast.makeText(this, "Este celular não libera a lente 0,6 para outros apps. Usando 1x.", Toast.LENGTH_LONG).show()
+                lente = "1"
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Erro na câmera: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+        val tem06 = infoUltra != null || ((infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) < 0.95f)
+        botoesZoom["0.6"]?.alpha = if (tem06) 1f else 0.35f
+        for ((k, b) in botoesZoom) {
+            val on = k == lente
+            (b.background as GradientDrawable).setColor(if (on) 0xFFF39200.toInt() else 0x66000000)
+        }
+    }
+
+    private fun trocarLente(k: String) {
+        if (k == lente) return
+        lente = k; prefs.edit().putString("lente", k).apply()
+        ligarLente()
+    }
+
+    private val orientacao by lazy {
+        object : OrientationEventListener(this) {
+            override fun onOrientationChanged(g: Int) {
+                if (g == ORIENTATION_UNKNOWN) return
+                val r = when (g) { in 45..134 -> Surface.ROTATION_270; in 135..224 -> Surface.ROTATION_180; in 225..314 -> Surface.ROTATION_90; else -> Surface.ROTATION_0 }
+                if (r != rotacao) {
+                    rotacao = r; captura?.targetRotation = r
+                    val graus = when (r) { Surface.ROTATION_90 -> 90f; Surface.ROTATION_270 -> -90f; Surface.ROTATION_180 -> 180f; else -> 0f }
+                    miniatura.animate().rotation(graus).start()
+                    for (b in botoesZoom.values) b.animate().rotation(graus).start()
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- foto
+
+    private fun fotografar() {
+        val cap = captura ?: return
+        val quando = Date()
+        val loc = local
+        val osAgora = os
+        val end = textoLocal(loc)
+        som.play(MediaActionSound.SHUTTER_CLICK)
+        flash.alpha = 0.8f; flash.animate().alpha(0f).setDuration(250).start()
+        cap.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val bmp = paraBitmap(image)
+                    image.close()
+                    val uri = gravar(bmp, quando, loc, osAgora, end)
+                    principal.post { if (uri != null) { ultimaFoto = uri; lerUltima() } else Toast.makeText(this@CameraActivity, "Não consegui salvar a foto", Toast.LENGTH_LONG).show() }
+                } catch (e: Throwable) {
+                    try { image.close() } catch (_: Exception) {}
+                    principal.post { Toast.makeText(this@CameraActivity, "Erro: ${e.message}", Toast.LENGTH_LONG).show() }
+                }
+            }
+            override fun onError(e: ImageCaptureException) {
+                principal.post { Toast.makeText(this@CameraActivity, "Erro ao fotografar: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        })
+    }
+
+    /** JPEG da câmera → bitmap girado, cortado em 4:3 e reduzido para 1600 x 1200 (ou 1200 x 1600 em pé). */
+    private fun paraBitmap(image: ImageProxy): Bitmap {
+        val buf = image.planes[0].buffer
+        val bytes = ByteArray(buf.remaining()); buf.get(bytes)
+        val op = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, op)
+        var amostra = 1
+        while (max(op.outWidth, op.outHeight) / (amostra * 2) >= LADO) amostra *= 2
+        val orig = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = amostra })
+        val rot = image.imageInfo.rotationDegrees
+        val girada = if (rot != 0) Bitmap.createBitmap(orig, 0, 0, orig.width, orig.height, Matrix().apply { postRotate(rot.toFloat()) }, true).also { if (it !== orig) orig.recycle() } else orig
+        val w = girada.width; val h = girada.height
+        val deitada = w >= h
+        val (cw, ch) = if (deitada) {
+            if (w * 3 > h * 4) Pair(h * 4 / 3, h) else Pair(w, w * 3 / 4)
+        } else {
+            if (h * 3 > w * 4) Pair(w, w * 4 / 3) else Pair(h * 3 / 4, h)
+        }
+        val cortada = Bitmap.createBitmap(girada, (w - cw) / 2, (h - ch) / 2, cw, ch)
+        val (fw, fh) = if (deitada) Pair(LADO, LADO * 3 / 4) else Pair(LADO * 3 / 4, LADO)
+        val final = Bitmap.createScaledBitmap(cortada, fw, fh, true)
+        if (cortada !== final && cortada !== girada) cortada.recycle()
+        if (girada !== final) girada.recycle()
+        return if (final.isMutable) final else final.copy(Bitmap.Config.ARGB_8888, true).also { final.recycle() }
+    }
+
+    private fun linhas(quando: Date, loc: Location?, end: Pair<String, String>?, o: JSONObject?): List<String> {
+        val c = Calendar.getInstance().apply { time = quando }
+        val l = mutableListOf<String>()
+        l.add("${c.get(Calendar.DAY_OF_MONTH)} de ${MESES[c.get(Calendar.MONTH)]} de ${c.get(Calendar.YEAR)} " +
+                SimpleDateFormat("HH:mm:ss", Locale.US).format(quando))
+        if (loc != null) l.add(dms(loc.latitude, true) + " " + dms(loc.longitude, false))
+        if (end != null) l.add(listOf(end.first, end.second).filter { it.isNotBlank() }.joinToString(", "))
+        if (o != null) l.add("OS " + o.optString("num"))
+        return l
+    }
+
+    private fun dms(v: Double, lat: Boolean): String {
+        val a = abs(v); val g = a.toInt(); val mf = (a - g) * 60; val m = mf.toInt(); val s = (mf - m) * 60
+        val ss = String.format(Locale.US, "%.5f", s).replace('.', ',')
+        val h = if (lat) (if (v < 0) "S" else "N") else (if (v < 0) "W" else "E")
+        return "$g°$m'$ss\"$h"
+    }
+
+    /** Carimbo igual ao do Timestamp: texto branco com sombra, alinhado à direita, no canto de baixo. */
+    private fun carimbar(b: Bitmap, l: List<String>) {
+        val cv = Canvas(b)
+        val tam = min(b.width, b.height) * 0.036f
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; textSize = tam; textAlign = Paint.Align.RIGHT
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+            setShadowLayer(tam * 0.12f, tam * 0.05f, tam * 0.05f, 0xCC000000.toInt())
+        }
+        val mg = min(b.width, b.height) * 0.02f
+        val passo = tam * 1.22f
+        var y = b.height - mg - (l.size - 1) * passo
+        for (t in l) { cv.drawText(t, b.width - mg, y, p); y += passo }
+    }
+
+    private fun nomePasta(o: JSONObject?): String {
+        if (o == null) return "Sem OS"
+        val partes = listOf("OS " + o.optString("num"), o.optString("cidade"), o.optString("bairro")).filter { it.isNotBlank() }
+        return partes.joinToString(" ").replace(Regex("[\\\\/:*?\"<>|]"), " ").replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun gravar(bmp0: Bitmap, quando: Date, loc: Location?, o: JSONObject?, end: Pair<String, String>?): Uri? {
+        carimbar(bmp0, linhas(quando, loc, end, o))
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(quando)
+        val nome = (if (o != null) "OS_" + o.optString("num") else "FOTO") + "_" + stamp + ".jpg"
+        val tmp = File(cacheDir, nome)
+        FileOutputStream(tmp).use { bmp0.compress(Bitmap.CompressFormat.JPEG, QUALIDADE, it) }
+        bmp0.recycle()
+        try {
+            val ex = ExifInterface(tmp.absolutePath)
+            val d = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(quando)
+            ex.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, d)
+            ex.setAttribute(ExifInterface.TAG_DATETIME, d)
+            ex.setAttribute(ExifInterface.TAG_MAKE, Build.MANUFACTURER)
+            ex.setAttribute(ExifInterface.TAG_MODEL, Build.MODEL)
+            ex.setAttribute(ExifInterface.TAG_SOFTWARE, "Carimbo A R Chaves")
+            if (o != null) ex.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, "OS " + o.optString("num"))
+            if (loc != null) {
+                ex.setGpsInfo(loc)
+            }
+            ex.saveAttributes()
+        } catch (_: Exception) {}
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, nome)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_TAKEN, quando.time)
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Carimbo/" + nomePasta(o))
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Carimbo/" + nomePasta(o)).apply { mkdirs() }
+                @Suppress("DEPRECATION")
+                put(MediaStore.Images.Media.DATA, File(dir, nome).absolutePath)
+            }
+        }
+        val u = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return null
+        contentResolver.openOutputStream(u)!!.use { out -> tmp.inputStream().use { it.copyTo(out) } }
+        if (Build.VERSION.SDK_INT >= 29) {
+            cv.clear(); cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+            contentResolver.update(u, cv, null, null)
+        }
+        tmp.delete()
+        return u
+    }
+
+    // ---------------------------------------------------------------- miniatura e envio
+
+    private fun lerUltima() {
+        thread {
+            val u = ultimaFoto ?: fotosDaPasta(null).firstOrNull()
+            val b = u?.let {
+                try {
+                    if (Build.VERSION.SDK_INT >= 29) contentResolver.loadThumbnail(it, Size(160, 160), null)
+                    else contentResolver.openInputStream(it)?.use { s -> BitmapFactory.decodeStream(s, null, BitmapFactory.Options().apply { inSampleSize = 8 }) }
+                } catch (_: Exception) { null }
+            }
+            principal.post { if (b != null) { miniatura.setImageBitmap(b); ultimaFoto = u } }
+        }
+    }
+
+    private fun abrirUltima() {
+        val u = ultimaFoto ?: return
+        try { startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "image/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) } catch (_: Exception) {}
+    }
+
+    /** Fotos do CARIMBO, mais novas primeiro. pasta = null pega todas. */
+    private fun fotosDaPasta(pasta: String?): List<Uri> {
+        val r = mutableListOf<Uri>()
+        val col = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val (sel, args) = if (Build.VERSION.SDK_INT >= 29) {
+            if (pasta == null) "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?" to arrayOf("Pictures/Carimbo/%")
+            else "${MediaStore.Images.Media.RELATIVE_PATH} = ?" to arrayOf("Pictures/Carimbo/$pasta/")
+        } else {
+            @Suppress("DEPRECATION")
+            "${MediaStore.Images.Media.DATA} LIKE ?" to arrayOf("%/Pictures/Carimbo/" + (pasta?.let { "$it/" } ?: "") + "%")
+        }
+        try {
+            contentResolver.query(col, arrayOf(MediaStore.Images.Media._ID), sel, args, "${MediaStore.Images.Media.DATE_TAKEN} DESC")?.use { c ->
+                while (c.moveToNext()) r.add(ContentUris.withAppendedId(col, c.getLong(0)))
+            }
+        } catch (_: Exception) {}
+        return r
+    }
+
+    /** Pastas de OS em Imagens/Carimbo com a quantidade de fotos, mais recentes primeiro. */
+    private fun pastas(): List<Pair<String, Int>> {
+        if (Build.VERSION.SDK_INT < 29) return listOf(nomePasta(os) to fotosDaPasta(nomePasta(os)).size)
+        val cont = LinkedHashMap<String, Int>()
+        try {
+            contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media.RELATIVE_PATH),
+                "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?", arrayOf("Pictures/Carimbo/%"), "${MediaStore.Images.Media.DATE_TAKEN} DESC")?.use { c ->
+                while (c.moveToNext()) {
+                    val p = c.getString(0).removePrefix("Pictures/Carimbo/").trimEnd('/')
+                    if (p.isNotEmpty() && !p.contains('/')) cont[p] = (cont[p] ?: 0) + 1
+                }
+            }
+        } catch (_: Exception) {}
+        return cont.entries.map { it.key to it.value }
+    }
+
+    private fun escolherPastaParaEnviar() {
+        thread {
+            val ps = pastas()
+            principal.post {
+                if (ps.isEmpty()) { Toast.makeText(this, "Ainda não há fotos do CARIMBO", Toast.LENGTH_SHORT).show(); return@post }
+                val atual = nomePasta(os)
+                val ord = ps.sortedByDescending { it.first == atual }
+                AlertDialog.Builder(this)
+                    .setTitle("Qual pasta enviar?")
+                    .setItems(ord.map { "${it.first} · ${it.second} ${if (it.second == 1) "foto" else "fotos"}" }.toTypedArray()) { _, k -> comoEnviar(ord[k].first) }
+                    .setNegativeButton("Cancelar", null).show()
+            }
+        }
+    }
+
+    private fun comoEnviar(pasta: String) {
+        AlertDialog.Builder(this)
+            .setTitle(pasta)
+            .setItems(arrayOf("Enviar as fotos (WhatsApp e outros)", "Enviar a pasta num arquivo .zip")) { _, k ->
+                if (k == 0) enviarFotos(pasta) else enviarZip(pasta)
+            }
+            .setNegativeButton("Cancelar", null).show()
+    }
+
+    private fun enviarFotos(pasta: String) {
+        thread {
+            val us = ArrayList(fotosDaPasta(pasta).reversed())
+            principal.post {
+                if (us.isEmpty()) return@post
+                val i = Intent(Intent.ACTION_SEND_MULTIPLE).putParcelableArrayListExtra(Intent.EXTRA_STREAM, us)
+                    .setType("image/jpeg").putExtra(Intent.EXTRA_TEXT, pasta).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                startActivity(Intent.createChooser(i, "Enviar ${us.size} fotos"))
+            }
+        }
+    }
+
+    private fun enviarZip(pasta: String) {
+        Toast.makeText(this, "Preparando o .zip…", Toast.LENGTH_SHORT).show()
+        thread {
+            val us = fotosDaPasta(pasta).reversed()
+            val dir = File(cacheDir, "zip").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
+            val z = File(dir, "$pasta.zip")
+            try {
+                ZipOutputStream(FileOutputStream(z)).use { zo ->
+                    us.forEachIndexed { k, u ->
+                        var nome = "foto_${k + 1}.jpg"
+                        contentResolver.query(u, arrayOf(MediaStore.Images.Media.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) nome = c.getString(0) }
+                        zo.putNextEntry(ZipEntry(nome))
+                        contentResolver.openInputStream(u)?.use { it.copyTo(zo) }
+                        zo.closeEntry()
+                    }
+                }
+                val uri = FileProvider.getUriForFile(this, "$packageName.arquivos", z)
+                principal.post {
+                    val i = Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, uri).setType("application/zip")
+                        .putExtra(Intent.EXTRA_TEXT, pasta).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    startActivity(Intent.createChooser(i, "Enviar $pasta.zip"))
+                }
+            } catch (e: Exception) {
+                principal.post { Toast.makeText(this, "Erro no .zip: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- OS
+
+    private fun acharOs(n: String): JSONObject? {
+        val alvo = n.trim().trimStart('0')
+        for (k in 0 until lista.length()) {
+            val o = lista.optJSONObject(k) ?: continue
+            if (o.optString("num").trimStart('0') == alvo) return o
+        }
+        return null
+    }
+
+    private fun distOs(o: JSONObject, l: Location): Double? =
+        if (o.has("lat") && o.has("lon")) dist(l.latitude, l.longitude, o.getDouble("lat"), o.getDouble("lon")) else null
+
+    private fun escolherOsPerto() {
+        val l = local ?: return
+        var melhor: JSONObject? = null; var md = RAIO_OS
+        for (k in 0 until lista.length()) {
+            val o = lista.optJSONObject(k) ?: continue
+            val d = distOs(o, l) ?: continue
+            if (d < md) { md = d; melhor = o }
+        }
+        if (melhor?.optString("num") != os?.optString("num")) { os = melhor; mostrarOs() }
+    }
+
+    private fun mostrarOs() {
+        if (!::osTxt.isInitialized) return
+        val o = os
+        osTxt.text = if (o == null) "Sem OS · toque para escolher" else {
+            val d = local?.let { distOs(o, it) }
+            "OS ${o.optString("num")} · ${o.optString("bairro").ifBlank { o.optString("cidade") }}" +
+                    (if (!osManual && d != null) " · ${d.roundToInt()} m" else "")
+        }
+        (osTxt.background as GradientDrawable).setColor(if (o == null) 0xFF555555.toInt() else 0xFF005CA9.toInt())
+    }
+
+    private fun escolherOsManual() {
+        val l = local
+        val itens = mutableListOf<Pair<String, JSONObject?>>()
+        val ord = (0 until lista.length()).mapNotNull { lista.optJSONObject(it) }
+            .sortedBy { o -> l?.let { distOs(o, it) } ?: Double.MAX_VALUE }
+        for (o in ord) {
+            val d = l?.let { distOs(o, it) }
+            val dt = when { d == null -> ""; d < 1000 -> " · ${d.roundToInt()} m"; else -> " · ${String.format(Locale("pt", "BR"), "%.1f", d / 1000)} km" }
+            itens.add("${o.optString("num")} · ${o.optString("cidade")} · ${o.optString("bairro")}$dt" to o)
+        }
+        itens.add("Digitar o número da OS" to JSONObject().put("_digitar", true))
+        itens.add("Sem OS" to null)
+        itens.add("Escolher sozinho pelo GPS" to JSONObject().put("_auto", true))
+        AlertDialog.Builder(this)
+            .setTitle(if (lista.length() == 0) "Abra pelo app OS Caixa para ver a lista" else "Qual OS?")
+            .setItems(itens.map { it.first }.toTypedArray()) { _, k ->
+                val o = itens[k].second
+                when {
+                    o == null -> { os = null; osManual = true; mostrarOs() }
+                    o.has("_auto") -> { osManual = false; os = null; escolherOsPerto(); mostrarOs() }
+                    o.has("_digitar") -> digitarOs()
+                    else -> { os = o; osManual = true; mostrarOs() }
+                }
+            }.show()
+    }
+
+    private fun digitarOs() {
+        val e = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER; hint = "ex.: 001279844" }
+        AlertDialog.Builder(this).setTitle("Número da OS").setView(e)
+            .setPositiveButton("OK") { _, _ ->
+                val n = e.text.toString().filter { it.isDigit() }
+                if (n.isNotEmpty()) {
+                    os = acharOs(n) ?: JSONObject().put("num", n.padStart(9, '0'))
+                    osManual = true; mostrarOs()
+                }
+            }.setNegativeButton("Cancelar", null).show()
+    }
+
+    // ---------------------------------------------------------------- GPS e endereço
+
+    private fun dist(a: Double, b: Double, c: Double, d: Double): Double {
+        val r = Math.PI / 180
+        val x = sin((c - a) * r / 2).let { it * it } + cos(a * r) * cos(c * r) * sin((d - b) * r / 2).let { it * it }
+        return 12742000 * asin(sqrt(x))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun ligarGps() {
+        if (gerente != null) return
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        val g = getSystemService(LOCATION_SERVICE) as LocationManager
+        gerente = g
+        for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            try {
+                if (g.isProviderEnabled(p)) {
+                    g.getLastKnownLocation(p)?.let { if (local == null || it.time > local!!.time) local = it }
+                    g.requestLocationUpdates(p, 1000L, 0f, ouvinte, Looper.getMainLooper())
+                }
+            } catch (_: Exception) {}
+        }
+        if (!osManual) escolherOsPerto()
+        atualizarEndereco()
+    }
+
+    private fun desligarGps() {
+        try { gerente?.removeUpdates(ouvinte) } catch (_: Exception) {}
+        gerente = null
+    }
+
+    /** Bairro e cidade: da OS quando o ponto está perto dela; senão pelo Geocoder; senão o município mais próximo. */
+    private fun textoLocal(l: Location?): Pair<String, String>? {
+        val o = os
+        if (o != null && o.optString("cidade").isNotBlank()) {
+            val d = l?.let { distOs(o, it) }
+            if (d == null || d < 600) return o.optString("bairro") to o.optString("cidade")
+        }
+        return endereco
+    }
+
+    private fun atualizarEndereco() {
+        val l = local ?: return
+        if (buscandoEndereco) return
+        val antes = enderecoEm
+        if (antes != null && dist(antes.latitude, antes.longitude, l.latitude, l.longitude) < 60) return
+        buscandoEndereco = true
+        thread {
+            var r: Pair<String, String>? = null
+            try {
+                if (Geocoder.isPresent()) {
+                    @Suppress("DEPRECATION")
+                    val a = Geocoder(this, Locale("pt", "BR")).getFromLocation(l.latitude, l.longitude, 1)?.firstOrNull()
+                    if (a != null) r = (a.subLocality ?: "") to (a.locality ?: a.subAdminArea ?: "")
+                }
+            } catch (_: Exception) {}
+            if (r == null || r.second.isBlank()) r = (r?.first ?: "") to (Municipios.maisProximo(this, l.latitude, l.longitude) ?: "")
+            principal.post { endereco = r; enderecoEm = l; buscandoEndereco = false }
+        }
+    }
+
+    private val relogio = object : Runnable {
+        override fun run() {
+            val l = local
+            carimboTxt.text = linhas(Date(), l, textoLocal(l), os).joinToString("\n")
+            gpsTxt.text = when {
+                l == null -> "Procurando GPS…"
+                System.currentTimeMillis() - l.time > 120_000 -> "GPS antigo ±${l.accuracy.roundToInt()} m"
+                else -> "GPS ±${l.accuracy.roundToInt()} m"
+            }
+            principal.postDelayed(this, 1000)
+        }
+    }
+}
+
+/** Municípios do Brasil (assets/mun.js) para achar a cidade sem internet. */
+object Municipios {
+    private var lista: List<Triple<String, Double, Double>>? = null
+    fun maisProximo(ctx: android.content.Context, la: Double, lo: Double): String? {
+        val l = lista ?: try {
+            val s = ctx.assets.open("mun.js").bufferedReader().readText()
+            val raw = s.substringAfter('"').substringBeforeLast('"')
+            raw.split(';').mapNotNull { p -> val c = p.split('|'); if (c.size >= 4) Triple(c[0], c[2].toDouble(), c[3].toDouble()) else null }
+        } catch (_: Exception) { emptyList() }
+        lista = l
+        return l.minByOrNull { (it.second - la) * (it.second - la) + (it.third - lo) * (it.third - lo) }?.first
+    }
+}
