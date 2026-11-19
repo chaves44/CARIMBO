@@ -228,8 +228,8 @@ class CameraActivity : ComponentActivity() {
         caixaPrevia.addView(textura, FrameLayout.LayoutParams(-1, -1))
         largPrev = larg; altPrev = alt
         val faixa = (alt - larg * 3 / 4) / 2
-        faixaCima = View(this).apply { setBackgroundColor(0x99000000.toInt()) }
-        faixaBaixo = View(this).apply { setBackgroundColor(0x99000000.toInt()) }
+        faixaCima = View(this).apply { setBackgroundColor(Color.BLACK) }
+        faixaBaixo = View(this).apply { setBackgroundColor(Color.BLACK) }
         caixaPrevia.addView(faixaCima, FrameLayout.LayoutParams(-1, faixa, Gravity.TOP))
         caixaPrevia.addView(faixaBaixo, FrameLayout.LayoutParams(-1, faixa, Gravity.BOTTOM))
         camada = FrameLayout(this)
@@ -652,7 +652,7 @@ class CameraActivity : ComponentActivity() {
                 SimpleDateFormat("HH:mm:ss", Locale.US).format(quando))
         if (loc != null) l.add(dms(loc.latitude, true) + " " + dms(loc.longitude, false))
         if (end != null) l.add(listOf(end.first, end.second).filter { it.isNotBlank() }.joinToString(", "))
-        if (o != null) l.add("OS " + o.optString("num"))
+        // o número da OS não vai escrito na foto: fica só nos metadados (EXIF) e no nome do arquivo
         return l
     }
 
@@ -699,7 +699,11 @@ class CameraActivity : ComponentActivity() {
             ex.setAttribute(ExifInterface.TAG_MAKE, Build.MANUFACTURER)
             ex.setAttribute(ExifInterface.TAG_MODEL, Build.MODEL)
             ex.setAttribute(ExifInterface.TAG_SOFTWARE, "Carimbo A R Chaves")
-            if (o != null) ex.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, "OS " + o.optString("num"))
+            if (o != null) {
+                val desc = listOf("OS " + o.optString("num"), o.optString("cidade"), o.optString("bairro")).filter { it.isNotBlank() }.joinToString(" · ")
+                ex.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, desc)
+                ex.setAttribute(ExifInterface.TAG_USER_COMMENT, desc)
+            }
             if (loc != null) {
                 ex.setGpsInfo(loc)
             }
