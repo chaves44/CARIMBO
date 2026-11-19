@@ -27,16 +27,20 @@ jobs:
         run: gradle assembleRelease --no-daemon
 
       - name: Renomear
-        run: cp app/build/outputs/apk/release/app-release.apk CARIMBO-${{ github.run_number }}.apk
+        run: |
+          cp app/build/outputs/apk/normal/release/app-normal-release.apk CARIMBO-${{ github.run_number }}.apk
+          cp app/build/outputs/apk/lente/release/app-lente-release.apk CARIMBO-lente06-${{ github.run_number }}.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: CARIMBO-apk
-          path: CARIMBO-${{ github.run_number }}.apk
+          path: CARIMBO-*.apk
 
       - name: Publicar versão
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: CARIMBO 1.0.${{ github.run_number }}
-          files: CARIMBO-${{ github.run_number }}.apk
+          files: |
+            CARIMBO-${{ github.run_number }}.apk
+            CARIMBO-lente06-${{ github.run_number }}.apk

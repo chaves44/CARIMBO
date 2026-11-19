@@ -25,6 +25,16 @@ android {
         }
     }
 
+    flavorDimensions += "pacote"
+    productFlavors {
+        create("normal") { dimension = "pacote" }
+        // Mesmo app com o nome de pacote que a Xiaomi costuma liberar para as lentes extras (teste da lente 0,6)
+        create("lente") {
+            dimension = "pacote"
+            applicationId = "org.codeaurora.snapcam"
+            resValue("string", "nome_app", "Carimbo 0,6")
+        }
+    }
     buildTypes {
         debug {
             signingConfig = signingConfigs.getByName("fixa")
