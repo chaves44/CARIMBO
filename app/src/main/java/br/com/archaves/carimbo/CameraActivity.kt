@@ -36,6 +36,9 @@ import android.view.MotionEvent
 import android.view.OrientationEventListener
 import android.view.ScaleGestureDetector
 import android.view.Surface
+import android.view.TextureView
+import android.hardware.camera2.CameraManager
+import androidx.camera.camera2.interop.Camera2Interop
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -118,6 +121,12 @@ class CameraActivity : ComponentActivity() {
     private var infoPrincipal: CameraInfo? = null
     private var infoUltra: CameraInfo? = null
     private var lente = "1"
+    private lateinit var textura: TextureView
+    private var c2: Camera2Ultra? = null
+    private var fisicoUltra: String? = null     // lente 0,6 dentro da câmera lógica principal
+    private var ocultoUltra: String? = null     // lente 0,6 escondida da lista, aberta pelo número
+    private var grausAparelho = 0
+    private var diag = StringBuilder()
     private val executor = Executors.newSingleThreadExecutor()
     private var rotacao = Surface.ROTATION_0
     private val som = MediaActionSound()
@@ -175,8 +184,8 @@ class CameraActivity : ComponentActivity() {
         mostrarOs()
     }
 
-    override fun onResume() { super.onResume(); ligarGps(); lerUltima() }
-    override fun onPause() { super.onPause(); desligarGps() }
+    override fun onResume() { super.onResume(); ligarGps(); lerUltima(); if (provedor != null && lente == "0.6" && ocultoUltra != null && textura.visibility == View.VISIBLE) usarCamera2(ocultoUltra!!) }
+    override fun onPause() { super.onPause(); desligarGps(); if (c2 != null) { c2?.fechar(); c2 = null } }
     override fun onDestroy() {
         orientacao.disable(); principal.removeCallbacks(relogio); executor.shutdown(); som.release()
         super.onDestroy()
@@ -206,6 +215,8 @@ class CameraActivity : ComponentActivity() {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
         caixaPrevia.addView(previa, FrameLayout.LayoutParams(-1, -1))
+        textura = TextureView(this).apply { visibility = View.GONE }
+        caixaPrevia.addView(textura, FrameLayout.LayoutParams(-1, -1))
         carimboTxt = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 12f; gravity = Gravity.END
             setShadowLayer(4f, 1f, 1f, Color.BLACK)
@@ -231,6 +242,7 @@ class CameraActivity : ComponentActivity() {
             val b = pilula(if (k == "0.6") "0,6" else k + "x").apply {
                 textSize = 13f; setPadding(dpi(12), dpi(6), dpi(12), dpi(6))
                 setOnClickListener { trocarLente(k) }
+                setOnLongClickListener { mostrarDiagnostico(); true }
             }
             botoesZoom[k] = b
             lentes.addView(b, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(6); rightMargin = dpi(6) })
@@ -336,28 +348,125 @@ class CameraActivity : ComponentActivity() {
                     .filter { it.second > fovP * 1.25 }
                     .maxByOrNull { it.second }?.first
             }
+            procurarUltraEscondida(fovP)
             lente = prefs.getString("lente", "1") ?: "1"
             ligarLente()
         }, androidx.core.content.ContextCompat.getMainExecutor(this))
     }
 
+    private fun fov(c: CameraCharacteristics): Double? {
+        val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull()
+        val s = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        return if (f != null && s != null && f > 0) 2 * atan(s.width / (2.0 * f)) else null
+    }
+    private fun graus(r: Double?) = r?.let { String.format(Locale.US, "%.0f°", Math.toDegrees(it)) } ?: "?"
+
+    /** Procura a lente 0,6 de três jeitos: câmera física dentro da principal, números escondidos e propriedade da Xiaomi. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun procurarUltraEscondida(fovP: Double?) {
+        diag = StringBuilder()
+        val g = getSystemService(CAMERA_SERVICE) as CameraManager
+        val lista = try { g.cameraIdList.toList() } catch (_: Exception) { emptyList() }
+        diag.append("Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
+        diag.append("Câmeras liberadas para apps: ${lista.joinToString(", ")}\n")
+        for (id in lista) {
+            try {
+                val c = g.getCameraCharacteristics(id)
+                val lado = if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK) "traseira" else "frontal"
+                val fis = if (Build.VERSION.SDK_INT >= 28) c.physicalCameraIds else emptySet()
+                val z = if (Build.VERSION.SDK_INT >= 30) c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower else null
+                diag.append("  câmera $id: $lado, ângulo ${graus(fov(c))}${if (fis.isNotEmpty()) ", lentes internas ${fis.joinToString(",")}" else ""}${if (z != null) ", zoom mínimo $z" else ""}\n")
+            } catch (e: Exception) { diag.append("  câmera $id: erro ${e.message}\n") }
+        }
+        // 1) lente física dentro da câmera lógica principal
+        val idPrincipal = try { infoPrincipal?.let { Camera2CameraInfo.from(it).cameraId } } catch (_: Exception) { null }
+        if (infoUltra == null && idPrincipal != null && Build.VERSION.SDK_INT >= 28) {
+            try {
+                for (f in g.getCameraCharacteristics(idPrincipal).physicalCameraIds) {
+                    val a = fov(g.getCameraCharacteristics(f))
+                    diag.append("  lente interna $f: ângulo ${graus(a)}\n")
+                    if (a != null && fovP != null && a > fovP * 1.25) fisicoUltra = f
+                }
+            } catch (_: Exception) {}
+        }
+        // 2) números de câmera que não aparecem na lista
+        for (n in 0..15) {
+            val id = n.toString()
+            if (id in lista) continue
+            try {
+                val c = g.getCameraCharacteristics(id)
+                val a = fov(c)
+                val tras = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                diag.append("  escondida $id: ${if (tras) "traseira" else "frontal"}, ângulo ${graus(a)}\n")
+                if (tras && a != null && fovP != null && a > fovP * 1.25 && ocultoUltra == null) ocultoUltra = id
+            } catch (_: Exception) {}
+        }
+        // 3) lista de apps que a Xiaomi libera para as lentes extras
+        val prop = try {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, "vendor.camera.aux.packagelist") as String
+        } catch (_: Exception) { "" }
+        diag.append("Apps liberados pela Xiaomi: ${prop.ifBlank { "(não deu para ler)" }}\n")
+        diag.append("Ângulo da principal: ${graus(fovP)}\n")
+        diag.append("Lente 0,6: " + when {
+            infoUltra != null -> "liberada direto"
+            fisicoUltra != null -> "lente interna $fisicoUltra"
+            ocultoUltra != null -> "escondida, número $ocultoUltra"
+            else -> "não achei"
+        } + "\n")
+    }
+
+    private fun mostrarDiagnostico() {
+        AlertDialog.Builder(this).setTitle("Lentes deste celular").setMessage(diag.toString())
+            .setPositiveButton("OK", null)
+            .setNeutralButton("Copiar") { _, _ ->
+                val cb = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cb.setPrimaryClip(android.content.ClipData.newPlainText("lentes", diag.toString()))
+                Toast.makeText(this, "Copiado", Toast.LENGTH_SHORT).show()
+            }.show()
+    }
+
+    private fun usarCamera2(id: String) {
+        provedor?.unbindAll(); camera = null; captura = null
+        previa.visibility = View.GONE; textura.visibility = View.VISIBLE
+        c2?.fechar()
+        c2 = Camera2Ultra(this, id, textura) { m ->
+            principal.post { Toast.makeText(this, m, Toast.LENGTH_LONG).show() }
+        }.also { it.abrir() }
+    }
+
+    private fun sairCamera2() {
+        c2?.fechar(); c2 = null
+        textura.visibility = View.GONE; previa.visibility = View.VISIBLE
+    }
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun ligarLente() {
         val p = provedor ?: return
+        if (lente == "0.6" && infoUltra == null && fisicoUltra == null && ocultoUltra != null &&
+            (infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) >= 0.95f) {
+            usarCamera2(ocultoUltra!!); pintarBotoes(); return
+        }
+        sairCamera2()
         val usarUltra = lente == "0.6" && infoUltra != null
+        val usarFisica = lente == "0.6" && !usarUltra && fisicoUltra != null
         val info = (if (usarUltra) infoUltra else infoPrincipal) ?: return
         val res = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(ResolutionStrategy(Size(2048, 1536), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
             .build()
-        val prev = Preview.Builder()
+        val pb = Preview.Builder()
             .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
-            .build().also { it.setSurfaceProvider(previa.surfaceProvider) }
-        val cap = ImageCapture.Builder()
+        val cb = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setResolutionSelector(res)
             .setJpegQuality(92)
             .setTargetRotation(rotacao)
-            .build()
+        if (usarFisica) {
+            Camera2Interop.Extender(pb).setPhysicalCameraId(fisicoUltra!!)
+            Camera2Interop.Extender(cb).setPhysicalCameraId(fisicoUltra!!)
+        }
+        val prev = pb.build().also { it.setSurfaceProvider(previa.surfaceProvider) }
+        val cap = cb.build()
         try {
             p.unbindAll()
             camera = p.bindToLifecycle(this, info.cameraSelector, prev, cap)
@@ -365,18 +474,22 @@ class CameraActivity : ComponentActivity() {
             val c = camera!!
             val minZ = c.cameraInfo.zoomState.value?.minZoomRatio ?: 1f
             when {
-                lente == "0.6" && !usarUltra && minZ < 0.95f -> c.cameraControl.setZoomRatio(max(0.6f, minZ))
+                lente == "0.6" && !usarUltra && !usarFisica && minZ < 0.95f -> c.cameraControl.setZoomRatio(max(0.6f, minZ))
                 lente == "2" -> c.cameraControl.setZoomRatio(2f)
                 else -> c.cameraControl.setZoomRatio(1f)
             }
-            if (lente == "0.6" && !usarUltra && minZ >= 0.95f) {
-                Toast.makeText(this, "Este celular não libera a lente 0,6 para outros apps. Usando 1x.", Toast.LENGTH_LONG).show()
+            if (lente == "0.6" && !usarUltra && !usarFisica && minZ >= 0.95f) {
+                Toast.makeText(this, "Não achei como abrir a lente 0,6 neste celular. Segure o botão 0,6 para ver o diagnóstico.", Toast.LENGTH_LONG).show()
                 lente = "1"
             }
         } catch (e: Exception) {
             Toast.makeText(this, "Erro na câmera: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        val tem06 = infoUltra != null || ((infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) < 0.95f)
+        pintarBotoes()
+    }
+
+    private fun pintarBotoes() {
+        val tem06 = infoUltra != null || fisicoUltra != null || ocultoUltra != null || ((infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) < 0.95f)
         botoesZoom["0.6"]?.alpha = if (tem06) 1f else 0.35f
         for ((k, b) in botoesZoom) {
             val on = k == lente
@@ -394,6 +507,7 @@ class CameraActivity : ComponentActivity() {
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(g: Int) {
                 if (g == ORIENTATION_UNKNOWN) return
+                grausAparelho = ((g + 45) / 90 * 90) % 360
                 val r = when (g) { in 45..134 -> Surface.ROTATION_270; in 135..224 -> Surface.ROTATION_180; in 225..314 -> Surface.ROTATION_90; else -> Surface.ROTATION_0 }
                 if (r != rotacao) {
                     rotacao = r; captura?.targetRotation = r
@@ -408,14 +522,27 @@ class CameraActivity : ComponentActivity() {
     // ---------------------------------------------------------------- foto
 
     private fun fotografar() {
-        val cap = captura ?: return
+        val ultra = c2
+        val cap = captura
+        if (ultra == null && cap == null) return
         val quando = Date()
         val loc = local
         val osAgora = os
         val end = textoLocal(loc)
         som.play(MediaActionSound.SHUTTER_CLICK)
         flash.alpha = 0.8f; flash.animate().alpha(0f).setDuration(250).start()
-        cap.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+        if (ultra != null) {
+            ultra.fotografar(grausAparelho) { bytes, rot ->
+                executor.execute {
+                    try {
+                        val uri = gravar(bytesParaBitmap(bytes, rot), quando, loc, osAgora, end)
+                        principal.post { if (uri != null) { ultimaFoto = uri; lerUltima() } }
+                    } catch (e: Throwable) { principal.post { Toast.makeText(this, "Erro: ${e.message}", Toast.LENGTH_LONG).show() } }
+                }
+            }
+            return
+        }
+        cap!!.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 try {
                     val bmp = paraBitmap(image)
@@ -437,12 +564,15 @@ class CameraActivity : ComponentActivity() {
     private fun paraBitmap(image: ImageProxy): Bitmap {
         val buf = image.planes[0].buffer
         val bytes = ByteArray(buf.remaining()); buf.get(bytes)
+        return bytesParaBitmap(bytes, image.imageInfo.rotationDegrees)
+    }
+
+    private fun bytesParaBitmap(bytes: ByteArray, rot: Int): Bitmap {
         val op = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, op)
         var amostra = 1
         while (max(op.outWidth, op.outHeight) / (amostra * 2) >= LADO) amostra *= 2
         val orig = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = amostra })
-        val rot = image.imageInfo.rotationDegrees
         val girada = if (rot != 0) Bitmap.createBitmap(orig, 0, 0, orig.width, orig.height, Matrix().apply { postRotate(rot.toFloat()) }, true).also { if (it !== orig) orig.recycle() } else orig
         val w = girada.width; val h = girada.height
         val deitada = w >= h
