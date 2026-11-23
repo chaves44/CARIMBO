@@ -129,6 +129,8 @@ class CameraActivity : ComponentActivity() {
     private var infoPrincipal: CameraInfo? = null
     private var infoUltra: CameraInfo? = null
     private var lente = "1"
+    private var frontal = false                 // câmera de selfie
+    private var infoFrontal: CameraInfo? = null
     private lateinit var textura: TextureView
     private var c2: Camera2Ultra? = null
     private var fisicoUltra: String? = null     // lente 0,6 dentro da câmera lógica principal
@@ -200,7 +202,7 @@ class CameraActivity : ComponentActivity() {
         mostrarOs()
     }
 
-    override fun onResume() { super.onResume(); ligarGps(); lerUltima(); if (provedor != null && lente == "0.6" && ocultoUltra != null && textura.visibility == View.VISIBLE) usarCamera2(ocultoUltra!!) }
+    override fun onResume() { super.onResume(); ligarGps(); lerUltima(); if (provedor != null && !frontal && lente == "0.6" && ocultoUltra != null && textura.visibility == View.VISIBLE) usarCamera2(ocultoUltra!!) }
     override fun onPause() { super.onPause(); desligarGps(); if (c2 != null) { c2?.fechar(); c2 = null } }
     override fun onDestroy() {
         orientacao.disable(); principal.removeCallbacks(relogio); executor.shutdown(); som.release()
@@ -281,6 +283,12 @@ class CameraActivity : ComponentActivity() {
             botoesZoom[k] = b
             lentes.addView(b, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(6); rightMargin = dpi(6) })
         }
+        val selfie = pilula("🤳 Selfie").apply {
+            textSize = 13f; setPadding(dpi(12), dpi(6), dpi(12), dpi(6))
+            setOnClickListener { trocarFrontal() }
+        }
+        botoesZoom["selfie"] = selfie
+        lentes.addView(selfie, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dpi(14); rightMargin = dpi(6) })
         raiz.addView(lentes, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = topo + alt - dpi(48) })
 
         // barra de baixo: miniatura, disparo, enviar
@@ -386,6 +394,9 @@ class CameraActivity : ComponentActivity() {
                     .filter { it.second > fovP * 1.25 }
                     .maxByOrNull { it.second }?.first
             }
+            infoFrontal = try {
+                p.availableCameraInfos.firstOrNull { CameraSelector.DEFAULT_FRONT_CAMERA.filter(listOf(it)).isNotEmpty() }
+            } catch (_: Exception) { null }
             procurarUltraEscondida(fovP)
             lente = prefs.getString("lente", "1") ?: "1"
             ligarLente()
@@ -480,6 +491,7 @@ class CameraActivity : ComponentActivity() {
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun ligarLente() {
         val p = provedor ?: return
+        if (frontal) { ligarFrontal(p); return }
         if (lente == "0.6" && infoUltra == null && fisicoUltra == null && ocultoUltra != null &&
             (infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) >= 0.95f) {
             usarCamera2(ocultoUltra!!); pintarBotoes(); return
@@ -526,16 +538,52 @@ class CameraActivity : ComponentActivity() {
         pintarBotoes()
     }
 
+    /** Câmera de selfie: sem 0,6 nem 2x; a foto sai do mesmo jeito (paisagem 4:3, carimbada). */
+    private fun ligarFrontal(p: ProcessCameraProvider) {
+        val info = infoFrontal
+        if (info == null) {
+            Toast.makeText(this, "Não achei a câmera de selfie", Toast.LENGTH_SHORT).show()
+            frontal = false; ligarLente(); return
+        }
+        sairCamera2()
+        val prev = Preview.Builder()
+            .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
+            .build().also { it.setSurfaceProvider(previa.surfaceProvider) }
+        val cap = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setResolutionSelector(ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .setResolutionStrategy(ResolutionStrategy(Size(4000, 3000), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                .build())
+            .setJpegQuality(97)
+            .setTargetRotation(rotacao)
+            .build()
+        try {
+            p.unbindAll()
+            camera = p.bindToLifecycle(this, info.cameraSelector, prev, cap)
+            captura = cap
+        } catch (e: Exception) {
+            Toast.makeText(this, "Erro na câmera de selfie: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+        pintarBotoes()
+    }
+
+    private fun trocarFrontal() {
+        frontal = !frontal
+        ligarLente()
+    }
+
     private fun pintarBotoes() {
         val tem06 = infoUltra != null || fisicoUltra != null || ocultoUltra != null || ((infoPrincipal?.zoomState?.value?.minZoomRatio ?: 1f) < 0.95f)
         botoesZoom["0.6"]?.alpha = if (tem06) 1f else 0.35f
         for ((k, b) in botoesZoom) {
-            val on = k == lente
+            val on = if (k == "selfie") frontal else (!frontal && k == lente)
             (b.background as GradientDrawable).setColor(if (on) 0xFFF39200.toInt() else 0x66000000)
         }
     }
 
     private fun trocarLente(k: String) {
+        if (frontal) { frontal = false; lente = k; prefs.edit().putString("lente", k).apply(); ligarLente(); return }
         if (k == lente) return
         lente = k; prefs.edit().putString("lente", k).apply()
         ligarLente()
