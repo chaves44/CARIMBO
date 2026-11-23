@@ -98,7 +98,10 @@ class CameraActivity : ComponentActivity() {
     companion object {
         // níveis de qualidade: lado maior (px) e JPEG. Padrão "Boa".
         val NIVEIS = listOf(Triple("Leve", 1600, 82), Triple("Boa", 2048, 90), Triple("Máxima", 2560, 94))
-        const val RAIO_OS = 300.0        // m: escolhe sozinho a OS mais próxima até essa distância
+        const val RAIO_OS = 300.0        // m: sugere a OS mais próxima até essa distância (mais a margem do GPS)
+        const val MARGEM_GPS_MAX = 100.0 // m: quanto da imprecisão do GPS entra na margem
+        const val AMBIGUA = 150.0        // m: outra OS até essa distância a mais = avisa que há duas perto
+        const val SOLTAR_OS = 800.0      // m: longe disso da OS confirmada, a próxima foto volta a perguntar
         const val REQ = 31
         private val MESES = arrayOf("jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez.")
     }
@@ -144,8 +147,11 @@ class CameraActivity : ComponentActivity() {
     private var enderecoEm: Location? = null
     private var buscandoEndereco = false
     private var lista = JSONArray()
-    private var os: JSONObject? = null
-    private var osManual = false
+    private var os: JSONObject? = null          // OS em uso (escolhida ou confirmada)
+    private var osManual = false                // true: não sugere outra pelo GPS
+    private var osPorGps = false                // a OS em uso veio de confirmação pela sugestão do GPS
+    private var sugestao: JSONObject? = null    // OS mais próxima, ainda não confirmada
+    private var aguardandoOs = false            // foto tirada esperando a confirmação da OS
     private var ultimaFoto: Uri? = null
     private val prefs by lazy { getSharedPreferences("camera", MODE_PRIVATE) }
     private var nivel = 1
@@ -156,6 +162,7 @@ class CameraActivity : ComponentActivity() {
     private val ouvinte = LocationListener { l ->
         val a = local
         if (a == null || l.time - a.time > 60_000 || l.accuracy <= a.accuracy + 15) local = l
+        soltarOsSeLonge()
         if (!osManual) escolherOsPerto()
         atualizarEndereco()
     }
@@ -188,7 +195,7 @@ class CameraActivity : ComponentActivity() {
         }
         i.getStringExtra("os")?.let { n ->
             val o = acharOs(n)
-            if (o != null) { os = o; osManual = true }
+            if (o != null) { os = o; osManual = true; osPorGps = false }
         }
         mostrarOs()
     }
@@ -289,7 +296,10 @@ class CameraActivity : ComponentActivity() {
             setOnClickListener { fotografar() }
         }
         val direita = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-        val enviar = pilula("Enviar", 0xFF25D366.toInt()).apply { setOnClickListener { escolherPastaParaEnviar() } }
+        val enviar = pilula("Enviar", 0xFF25D366.toInt()).apply {
+            setOnClickListener { enviarOsAtual() }
+            setOnLongClickListener { escolherPastaParaEnviar(); true }
+        }
         val mais = TextView(this).apply {
             text = "Editar fotos"; setTextColor(0xFFBBBBBB.toInt()); textSize = 12f; gravity = Gravity.CENTER
             setPadding(0, dpi(8), 0, 0)
@@ -569,22 +579,26 @@ class CameraActivity : ComponentActivity() {
     // ---------------------------------------------------------------- foto
 
     private fun fotografar() {
+        if (aguardandoOs) { Toast.makeText(this, "Confirme antes a OS da foto anterior", Toast.LENGTH_SHORT).show(); return }
         val ultra = c2
         val cap = captura
         if (ultra == null && cap == null) return
         val quando = Date()
         val loc = local
         val osAgora = os
-        val end = textoLocal(loc)
         som.play(MediaActionSound.SHUTTER_CLICK)
         flash.alpha = 0.8f; flash.animate().alpha(0f).setDuration(250).start()
+        val semPerguntar = osAgora != null || osManual      // OS escolhida, ou "Sem OS" escolhido de propósito
+        if (!semPerguntar) aguardandoOs = true
+        val depois: (Bitmap) -> Unit = { bmp ->
+            if (semPerguntar) salvarFoto(bmp, quando, loc, osAgora)
+            else principal.post { confirmarOs(bmp, quando, loc) }
+        }
         if (ultra != null) {
             ultra.fotografar(grausAparelho) { bytes, rot ->
                 executor.execute {
-                    try {
-                        val uri = gravar(bytesParaBitmap(bytes, rot), quando, loc, osAgora, end)
-                        principal.post { if (uri != null) { ultimaFoto = uri; lerUltima() } }
-                    } catch (e: Throwable) { principal.post { Toast.makeText(this, "Erro: ${e.message}", Toast.LENGTH_LONG).show() } }
+                    try { depois(bytesParaBitmap(bytes, rot)) }
+                    catch (e: Throwable) { aguardandoOs = false; principal.post { Toast.makeText(this, "Erro: ${e.message}", Toast.LENGTH_LONG).show() } }
                 }
             }
             return
@@ -594,17 +608,101 @@ class CameraActivity : ComponentActivity() {
                 try {
                     val bmp = paraBitmap(image)
                     image.close()
-                    val uri = gravar(bmp, quando, loc, osAgora, end)
-                    principal.post { if (uri != null) { ultimaFoto = uri; lerUltima() } else Toast.makeText(this@CameraActivity, "Não consegui salvar a foto", Toast.LENGTH_LONG).show() }
+                    depois(bmp)
                 } catch (e: Throwable) {
+                    aguardandoOs = false
                     try { image.close() } catch (_: Exception) {}
                     principal.post { Toast.makeText(this@CameraActivity, "Erro: ${e.message}", Toast.LENGTH_LONG).show() }
                 }
             }
             override fun onError(e: ImageCaptureException) {
+                aguardandoOs = false
                 principal.post { Toast.makeText(this@CameraActivity, "Erro ao fotografar: ${e.message}", Toast.LENGTH_LONG).show() }
             }
         })
+    }
+
+    /** Grava (fora da tela principal) e atualiza a miniatura. */
+    private fun salvarFoto(bmp: Bitmap, quando: Date, loc: Location?, o: JSONObject?) {
+        executor.execute {
+            try {
+                val uri = gravar(bmp, quando, loc, o, textoLocal(loc, o))
+                principal.post { if (uri != null) { ultimaFoto = uri; lerUltima() } else Toast.makeText(this, "Não consegui salvar a foto", Toast.LENGTH_LONG).show() }
+            } catch (e: Throwable) {
+                principal.post { Toast.makeText(this, "Erro: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    private fun metros(d: Double): String =
+        if (d < 1000) "${d.roundToInt()} m" else String.format(Locale("pt", "BR"), "%.1f km", d / 1000)
+
+    /**
+     * Foto tirada sem OS escolhida: sugere a OS aberta mais próxima, com margem de segurança,
+     * e só salva depois que André confirmar.
+     */
+    private fun confirmarOs(bmp: Bitmap, quando: Date, loc: Location?) {
+        val terminar: (JSONObject?, Boolean) -> Unit = { o, lembrar ->
+            aguardandoOs = false
+            if (lembrar && o != null) { os = o; osManual = true; osPorGps = true; sugestao = null; mostrarOs() }
+            salvarFoto(bmp, quando, loc, o)
+            Toast.makeText(this, if (o == null) "Foto salva sem OS" else "Foto salva na OS ${o.optString("num")}", Toast.LENGTH_SHORT).show()
+        }
+        val ord = (0 until lista.length()).mapNotNull { lista.optJSONObject(it) }
+            .mapNotNull { o -> loc?.let { l -> distOs(o, l) }?.let { o to it } }
+            .sortedBy { it.second }
+        val idade = loc?.let { System.currentTimeMillis() - it.time } ?: Long.MAX_VALUE
+        val prec = loc?.accuracy?.toDouble() ?: Double.MAX_VALUE
+        val gpsBom = loc != null && idade < 120_000 && prec <= MARGEM_GPS_MAX
+        val limite = RAIO_OS + (if (gpsBom) prec else 0.0)
+        val perto = ord.firstOrNull()?.takeIf { gpsBom && it.second <= limite }
+
+        if (perto == null) {
+            val motivo = when {
+                lista.length() == 0 -> "A lista de OS está vazia. Abra o CARIMBO pelo app OS CAIXA para carregar as OS abertas."
+                loc == null -> "Ainda sem GPS, não dá para saber de qual OS é a foto."
+                !gpsBom -> "O GPS está impreciso (±${prec.roundToInt()} m${if (idade >= 120_000) ", leitura antiga" else ""}), não dá para sugerir a OS com segurança."
+                ord.isEmpty() -> "Nenhuma OS aberta tem coordenadas."
+                else -> "Nenhuma OS aberta a menos de ${metros(limite)} daqui. A mais próxima é a ${ord[0].first.optString("num")}, a ${metros(ord[0].second)}."
+            }
+            AlertDialog.Builder(this).setTitle("De qual OS é esta foto?").setMessage(motivo).setCancelable(false)
+                .setPositiveButton("Escolher a OS") { _, _ -> escolherOsParaFoto(loc) { o -> terminar(o, o != null) } }
+                .setNegativeButton("Salvar sem OS") { _, _ -> terminar(null, false) }
+                .show()
+            return
+        }
+
+        val (o, d) = perto
+        val segunda = ord.getOrNull(1)?.takeIf { it.second - d <= AMBIGUA }
+        val msg = StringBuilder()
+            .append("OS ${o.optString("num")}\n")
+            .append(listOf(o.optString("bairro"), o.optString("cidade")).filter { it.isNotBlank() }.joinToString(", ")).append("\n\n")
+            .append("Distância: ${metros(d)} (GPS ±${prec.roundToInt()} m)")
+        if (d > RAIO_OS / 2) msg.append("\n\nAtenção: o ponto da OS está a mais de ${metros(RAIO_OS / 2)}. Confira se é o imóvel certo.")
+        if (segunda != null) msg.append("\n\nCuidado: a OS ${segunda.first.optString("num")} (${segunda.first.optString("bairro").ifBlank { segunda.first.optString("cidade") }}) também está perto, a ${metros(segunda.second)}.")
+        AlertDialog.Builder(this).setTitle("Salvar nesta OS?").setMessage(msg.toString()).setCancelable(false)
+            .setPositiveButton("Sim, é esta") { _, _ -> terminar(o, true) }
+            .setNeutralButton("Outra OS") { _, _ -> escolherOsParaFoto(loc) { x -> terminar(x, x != null) } }
+            .setNegativeButton("Sem OS") { _, _ -> terminar(null, false) }
+            .show()
+    }
+
+    /** Lista das OS (mais perto primeiro) para a foto que está esperando. */
+    private fun escolherOsParaFoto(loc: Location?, fim: (JSONObject?) -> Unit) {
+        val ord = (0 until lista.length()).mapNotNull { lista.optJSONObject(it) }
+            .sortedBy { o -> loc?.let { distOs(o, it) } ?: Double.MAX_VALUE }
+        val nomes = ord.map { o ->
+            val d = loc?.let { distOs(o, it) }
+            "${o.optString("num")} · ${o.optString("cidade")} · ${o.optString("bairro")}" + (d?.let { " · " + metros(it) } ?: "")
+        } + listOf("Digitar o número da OS", "Salvar sem OS")
+        AlertDialog.Builder(this).setTitle("Qual OS?").setCancelable(false)
+            .setItems(nomes.toTypedArray()) { _, k ->
+                when {
+                    k < ord.size -> fim(ord[k])
+                    k == ord.size -> digitarOs { n -> fim(n) }
+                    else -> fim(null)
+                }
+            }.show()
     }
 
     /** JPEG da câmera → bitmap girado, cortado em 4:3 e reduzido para 1600 x 1200 (ou 1200 x 1600 em pé). */
@@ -788,6 +886,20 @@ class CameraActivity : ComponentActivity() {
         return cont.entries.map { it.key to it.value }
     }
 
+    /** Enviar: manda direto as fotos da OS em uso. Sem OS, mostra as pastas. Segurar o botão também mostra as pastas. */
+    private fun enviarOsAtual() {
+        val o = os
+        if (o == null) { escolherPastaParaEnviar(); return }
+        val pasta = nomePasta(o)
+        thread {
+            val n = fotosDaPasta(pasta).size
+            principal.post {
+                if (n == 0) Toast.makeText(this, "A OS ${o.optString("num")} ainda não tem fotos", Toast.LENGTH_SHORT).show()
+                else enviarFotos(pasta)
+            }
+        }
+    }
+
     private fun escolherPastaParaEnviar() {
         thread {
             val ps = pastas()
@@ -866,26 +978,48 @@ class CameraActivity : ComponentActivity() {
     private fun distOs(o: JSONObject, l: Location): Double? =
         if (o.has("lat") && o.has("lon")) dist(l.latitude, l.longitude, o.getDouble("lat"), o.getDouble("lon")) else null
 
+    /** Só sugere (não escolhe): a confirmação acontece na hora de salvar a foto. */
     private fun escolherOsPerto() {
         val l = local ?: return
-        var melhor: JSONObject? = null; var md = RAIO_OS
+        var melhor: JSONObject? = null; var md = RAIO_OS + l.accuracy.toDouble().coerceAtMost(MARGEM_GPS_MAX)
         for (k in 0 until lista.length()) {
             val o = lista.optJSONObject(k) ?: continue
             val d = distOs(o, l) ?: continue
             if (d < md) { md = d; melhor = o }
         }
-        if (melhor?.optString("num") != os?.optString("num")) { os = melhor; mostrarOs() }
+        if (melhor?.optString("num") != sugestao?.optString("num")) { sugestao = melhor; mostrarOs() }
+    }
+
+    /** Saiu de perto da OS confirmada pelo GPS: a próxima foto volta a perguntar. */
+    private fun soltarOsSeLonge() {
+        val o = os ?: return
+        val l = local ?: return
+        if (!osPorGps) return
+        val d = distOs(o, l) ?: return
+        if (d > SOLTAR_OS && l.accuracy < MARGEM_GPS_MAX) {
+            os = null; osManual = false; osPorGps = false; mostrarOs()
+            Toast.makeText(this, "Saiu de perto da OS ${o.optString("num")}: a próxima foto vai perguntar a OS", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun mostrarOs() {
         if (!::osTxt.isInitialized) return
         val o = os
-        osTxt.text = if (o == null) "Sem OS · toque para escolher" else {
-            val d = local?.let { distOs(o, it) }
-            "OS ${o.optString("num")} · ${o.optString("bairro").ifBlank { o.optString("cidade") }}" +
-                    (if (!osManual && d != null) " · ${d.roundToInt()} m" else "")
+        val sg = sugestao
+        var cor = 0xFF005CA9.toInt()
+        osTxt.text = when {
+            o != null -> {
+                val d = local?.let { distOs(o, it) }
+                "OS ${o.optString("num")} · ${o.optString("bairro").ifBlank { o.optString("cidade") }}" + (if (osPorGps && d != null) " · ${metros(d)}" else "")
+            }
+            sg != null && !osManual -> {
+                cor = 0xFFF39200.toInt()
+                val d = local?.let { distOs(sg, it) }
+                "OS ${sg.optString("num")}? · ${sg.optString("bairro").ifBlank { sg.optString("cidade") }}" + (d?.let { " · " + metros(it) } ?: "") + " · confirma na foto"
+            }
+            else -> { cor = 0xFF555555.toInt(); "Sem OS · toque para escolher" }
         }
-        (osTxt.background as GradientDrawable).setColor(if (o == null) 0xFF555555.toInt() else 0xFF005CA9.toInt())
+        (osTxt.background as GradientDrawable).setColor(cor)
     }
 
     private fun escolherOsManual() {
@@ -900,30 +1034,27 @@ class CameraActivity : ComponentActivity() {
         }
         itens.add("Digitar o número da OS" to JSONObject().put("_digitar", true))
         itens.add("Sem OS" to null)
-        itens.add("Escolher sozinho pelo GPS" to JSONObject().put("_auto", true))
+        itens.add("Sugerir pelo GPS (confirma na foto)" to JSONObject().put("_auto", true))
         AlertDialog.Builder(this)
             .setTitle(if (lista.length() == 0) "Abra pelo app OS Caixa para ver a lista" else "Qual OS?")
             .setItems(itens.map { it.first }.toTypedArray()) { _, k ->
                 val o = itens[k].second
                 when {
-                    o == null -> { os = null; osManual = true; mostrarOs() }
-                    o.has("_auto") -> { osManual = false; os = null; escolherOsPerto(); mostrarOs() }
-                    o.has("_digitar") -> digitarOs()
-                    else -> { os = o; osManual = true; mostrarOs() }
+                    o == null -> { os = null; osManual = true; osPorGps = false; mostrarOs() }
+                    o.has("_auto") -> { osManual = false; osPorGps = false; os = null; sugestao = null; escolherOsPerto(); mostrarOs() }
+                    o.has("_digitar") -> digitarOs { n -> if (n != null) { os = n; osManual = true; osPorGps = false; mostrarOs() } }
+                    else -> { os = o; osManual = true; osPorGps = false; mostrarOs() }
                 }
             }.show()
     }
 
-    private fun digitarOs() {
+    private fun digitarOs(fim: (JSONObject?) -> Unit) {
         val e = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER; hint = "ex.: 001279844" }
-        AlertDialog.Builder(this).setTitle("Número da OS").setView(e)
+        AlertDialog.Builder(this).setTitle("Número da OS").setView(e).setCancelable(false)
             .setPositiveButton("OK") { _, _ ->
                 val n = e.text.toString().filter { it.isDigit() }
-                if (n.isNotEmpty()) {
-                    os = acharOs(n) ?: JSONObject().put("num", n.padStart(9, '0'))
-                    osManual = true; mostrarOs()
-                }
-            }.setNegativeButton("Cancelar", null).show()
+                fim(if (n.isNotEmpty()) acharOs(n) ?: JSONObject().put("num", n.padStart(9, '0')) else null)
+            }.setNegativeButton("Cancelar") { _, _ -> fim(null) }.show()
     }
 
     // ---------------------------------------------------------------- GPS e endereço
@@ -959,8 +1090,7 @@ class CameraActivity : ComponentActivity() {
     }
 
     /** Bairro e cidade: da OS quando o ponto está perto dela; senão pelo Geocoder; senão o município mais próximo. */
-    private fun textoLocal(l: Location?): Pair<String, String>? {
-        val o = os
+    private fun textoLocal(l: Location?, o: JSONObject? = os): Pair<String, String>? {
         if (o != null && o.optString("cidade").isNotBlank()) {
             val d = l?.let { distOs(o, it) }
             if (d == null || d < 600) return o.optString("bairro") to o.optString("cidade")
