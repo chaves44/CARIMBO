@@ -943,7 +943,7 @@ class CameraActivity : ComponentActivity() {
             val n = fotosDaPasta(pasta).size
             principal.post {
                 if (n == 0) Toast.makeText(this, "A OS ${o.optString("num")} ainda não tem fotos", Toast.LENGTH_SHORT).show()
-                else enviarFotos(pasta)
+                else comoEnviar(pasta, n)
             }
         }
     }
@@ -963,10 +963,11 @@ class CameraActivity : ComponentActivity() {
         }
     }
 
-    private fun comoEnviar(pasta: String) {
+    private fun comoEnviar(pasta: String, n: Int = 0) {
+        val qtd = if (n > 0) " ($n ${if (n == 1) "foto" else "fotos"})" else ""
         AlertDialog.Builder(this)
-            .setTitle(pasta)
-            .setItems(arrayOf("Enviar as fotos (WhatsApp e outros)", "Enviar a pasta num arquivo .zip")) { _, k ->
+            .setTitle(pasta + qtd)
+            .setItems(arrayOf("📷 Enviar as fotos (WhatsApp e outros)", "🗜 Enviar a pasta num arquivo ZIP")) { _, k ->
                 if (k == 0) enviarFotos(pasta) else enviarZip(pasta)
             }
             .setNegativeButton("Cancelar", null).show()
